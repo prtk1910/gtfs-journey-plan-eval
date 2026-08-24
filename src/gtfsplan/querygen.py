@@ -1,0 +1,56 @@
+"""Render natural-language journey queries from gold items."""
+
+from __future__ import annotations
+
+import random
+
+PARAPHRASES = [
+    ("How do I get from {o} to {d}? I want to leave around {time}.",
+     "Plan me a public transit journey from {o} to {d}, departing near {time}."),
+    ("I need to travel by public transport from {o} to {d}, leaving at approximately {time}. What is the best route?",
+     "Using this city's transit network, what route should I take from {o} to reach {d} if I start around {time}?"),
+]
+
+INSTRUCTIONS = (
+    "You are a trip planner with knowledge of the {city} public transit network. "
+    "Respond with ONLY a JSON object (no prose, no markdown) of the form:\n"
+    '{{"legs": [{{"type": "ride"|"walk", "route": "<route name/number as shown to riders>", '
+    '"from": "<stop name>", "to": "<stop name>", "depart": "HH:MM", "arrive": "HH:MM"}}]}}\n'
+    'Legs must be in travel order. Use "ride" for vehicles (include the route) and "walk" '
+    'for walking transfers. Times use 24-hour HH:MM. Set "verified": true only for legs '
+    'whose exact times you can confirm from any provided schedule information; use false '
+    'for legs planned from general knowledge. Always provide your best complete itinerary; '
+    'if you believe no reasonable transit journey exists, respond {{"legs": []}}.'
+)
+
+CITY = {
+    "trimet": "Portland, Oregon",
+    "cta": "Chicago",
+    "hsl": "Helsinki region",
+    "mta": "New York City",
+}
+
+
+def render_query(item: dict, variant: int) -> str:
+    rng = random.Random(hash((item["feed"], item["origin"], item["destination"], item["dep_time"], variant)) & 0xFFFF)
+    tmpl = PARAPHRASES[variant % len(PARAPHRASES)][rng.randrange(2)]
+    hh, mm = divmod(item["dep_time"], 3600)
+    mm2, _ = divmod(mm, 60)
+    time_str = f"{hh + mm2 // 60:02d}:{mm % 60:02d}"
+    return tmpl.format(o=item["origin_name"], d=item["destination_name"], time=time_str)
+
+
+def build_messages(item: dict, arm: str, excerpt: str | None, variant: int = 0) -> list[dict]:
+    q = render_query(item, variant)
+    sys_text = INSTRUCTIONS.format(city=CITY.get(item["feed"], "the"))
+    content = q
+    if arm == "schedule_excerpt":
+        content = f"{q}\n\nRelevant schedule information for the network:\n\n{excerpt}"
+    elif arm == "neighborhood":
+        content = f"{q}\n\nBroader neighborhood schedule information:\n\n{excerpt}"
+    sys_text += (" IMPORTANT: keep your reasoning very brief (at most a few short "
+                 "steps); commit to your best answer quickly.")
+    return [
+        {"role": "system", "content": sys_text},
+        {"role": "user", "content": content},
+    ]

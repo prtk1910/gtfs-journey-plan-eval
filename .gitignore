@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Data artifacts (regenerable)
+artifacts/
+*.sqlite
+*.sqlite-journal
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# Manuscripts (generated locally; not part of the implementation)
+PAPER.md
+PAPER.docx
