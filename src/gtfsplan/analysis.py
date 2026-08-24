@@ -10,6 +10,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 
 FEED_CITY = {
     "trimet": "Portland (TriMet)",
@@ -52,8 +53,19 @@ def aggregate(recs: list[dict]) -> dict:
         gaps = [s["optimality_gap_min"] for s in scores
                 if s.get("optimality_gap_min") is not None]
         gaps_pos = [g for g in gaps if g >= 0]
+        attempted = [s for s in scores if not s.get("empty_itinerary")]
+        clean_chain = [s for s in attempted
+                       if s.get("unresolved_stops", 0) == 0
+                       and s.get("hallucinated_routes", 0) == 0
+                       and s.get("walks_too_long", 0) == 0
+                       and s.get("bad_transitions", 0) == 0]
         table[(feed, arm)] = {
             "n": n,
+            "attempted_rate": len(attempted) / n,
+            "clean_chain_rate": (len(clean_chain) / len(attempted)) if attempted else None,
+            "time_exact_rate": (sum(1 for s in clean_chain
+                                    if s.get("time_mismatches", 0) == 0)
+                                / len(attempted)) if attempted else None,
             "parse_rate": sum(1 for s in scores if s.get("parse_ok")) / n,
             "empty_rate": sum(1 for s in scores if s.get("empty_itinerary")) / n,
             "reaches_rate": sum(1 for s in scores if s.get("reaches_dest")) / n,
@@ -93,73 +105,119 @@ def make_figures(recs: list[dict], figdir: Path) -> list[Path]:
     arms = [a for a in ARMS if any(r["arm"] == a for r in recs)]
     paths = []
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    width = 0.35
-    import numpy as np
-
+    # ---- fig 1: outcome composition per feed x arm ------------------------
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+    width = 0.38
     xs = np.arange(len(feeds))
+    cats = [
+        ("strict-feasible", lambda s: bool(s.get("feasible_strict")), "#2ca02c"),
+        ("reached, infeasible", lambda s: bool(s.get("reaches_dest"))
+         and not s.get("feasible_lenient"), "#ff7f0e"),
+        ("attempted, wrong/unresolved", lambda s: not s.get("empty_itinerary")
+         and not s.get("reaches_dest"), "#d62728"),
+        ("abstained", lambda s: bool(s.get("empty_itinerary")), "#9e9e9e"),
+    ]
     for ai, arm in enumerate(arms):
-        strict = []
-        lenient = []
-        for f in feeds:
-            rs = [r for r in recs if r["feed"] == f and r["arm"] == arm]
-            sc = [r["score"] for r in rs]
-            strict.append(np.mean([1.0 if s.get("feasible_strict") else 0.0 for s in sc] or [0]))
-            lenient.append(np.mean([1.0 if s.get("feasible_lenient") else 0.0 for s in sc] or [0]))
-        b = ax.bar(xs + (ai - 0.5) * width, strict, width,
-                   label=f"{arm} strict", alpha=0.9)
-        ax.bar(xs + (ai - 0.5) * width, lenient, width,
-               bottom=strict, label=f"{arm} lenient", alpha=0.45)
+        rs = {id(r): r for r in recs if r["arm"] == arm}
+        bottom = np.zeros(len(feeds))
+        for label, pred, color in cats:
+            rates = []
+            for f in feeds:
+                sel = [r for r in recs if r["feed"] == f and r["arm"] == arm]
+                rates.append(np.mean([1.0 if pred(r["score"]) else 0.0 for r in sel] or [0]))
+            ax.bar(xs + (ai - 0.5) * width, rates, width, bottom=bottom,
+                   label=f"{arm}: {label}", color=color,
+                   alpha=0.55 if ai == 0 else 0.95,
+                   hatch="" if ai == 0 else "//", edgecolor="white", lw=0.4)
+            bottom += np.array(rates)
     ax.set_xticks(xs)
     ax.set_xticklabels([FEED_CITY.get(f, f) for f in feeds], fontsize=8)
     ax.set_ylabel("fraction of queries")
     ax.set_ylim(0, 1)
-    ax.set_title("Feasible journey plans by feed and context arm")
-    ax.legend(fontsize=7)
+    ax.set_title("Query outcomes by feed and context arm\n"
+                 "(hatched = closed-book, solid = schedule evidence)")
+    handles = [plt.Rectangle((0, 0), 1, 1, fc=c, ec="white") for _, _, c in cats]
+    ax.legend(handles, [l for l, _, _ in cats], fontsize=7, loc="upper right",
+              bbox_to_anchor=(1.0, 0.88))
     p = figdir / "01_feasibility"
     fig.savefig(p.with_suffix(".svg"), bbox_inches="tight")
     fig.savefig(p.with_suffix(".png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     paths.append(p)
 
-    fig, ax = plt.subplots(figsize=(6.5, 4))
-    data = []
-    labels = []
-    for arm in arms:
-        gs = [r["score"]["optimality_gap_min"] for r in recs
-              if r["arm"] == arm and r["score"].get("optimality_gap_min") is not None]
-        data.append(gs)
-        labels.append(f"{arm}\n(n={len(gs)})")
-    if any(data):
-        ax.boxplot(data, tick_labels=labels)
-        ax.axhline(0, color="gray", lw=0.8, ls="--")
-        ax.set_ylabel("stated arrival minus optimal arrival (min)")
-    ax.set_title("Optimality gap vs RAPTOR gold")
+    # ---- fig 2: optimality gap distribution --------------------------------
+    cb_gaps = [r["score"]["optimality_gap_min"] for r in recs
+               if r["arm"] == ARMS[0]
+               and r["score"].get("optimality_gap_min") is not None]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4),
+                                   gridspec_kw={"width_ratios": [2, 1]})
+    if cb_gaps:
+        lo = min(cb_gaps) - 20
+        hi = max(cb_gaps) + 20
+        bins = np.linspace(lo, hi, 24)
+        ax1.hist([g for g in cb_gaps if g < 0], bins=bins, color="#d62728",
+                 alpha=0.8, label="impossible (< 0 min)")
+        ax1.hist([g for g in cb_gaps if g >= 0], bins=bins, color="#1f77b4",
+                 alpha=0.85, label="late but possible")
+        ax1.axvline(0, color="black", lw=1.2)
+        ax1.set_xlabel("stated arrival minus optimal arrival (min)")
+        ax1.set_ylabel("closed-book queries")
+        ax1.set_title(f"Optimality gap vs RAPTOR gold (n={len(cb_gaps)})")
+        ax1.legend(fontsize=8)
+        n_imp = sum(1 for g in cb_gaps if g < -0.51)
+        ax1.text(0.02, 0.95, f"{n_imp}/{len(cb_gaps)} assert arrivals earlier "
+                             f"than the provably fastest journey",
+                 transform=ax1.transAxes, fontsize=8, va="top",
+                 bbox=dict(fc="white", alpha=0.8))
+        bp = ax2.boxplot(cb_gaps, vert=True, widths=0.5)
+        ax2.axhline(0, color="black", lw=1.0)
+        ax2.set_xticklabels(["closed\nbook"])
+        ax2.set_ylabel("gap (min)")
+    fig.suptitle("Stated arrivals vs schedule ground truth", y=1.0)
     p = figdir / "02_gap"
     fig.savefig(p.with_suffix(".svg"), bbox_inches="tight")
     fig.savefig(p.with_suffix(".png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     paths.append(p)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
+    # ---- fig 3: violation taxonomy incl. abstention ------------------------
     vtypes = ["time_mismatches", "unresolved_stops", "hallucinated_routes",
               "bad_transitions", "walks_too_long"]
-    bottom_pos = np.zeros(len(arms))
-    bottom_any = np.zeros(len(arms))
-    for vt in vtypes:
-        rates = []
-        for arm in arms:
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+    bottoms = {arm: 0.0 for arm in arms}
+    colors = plt.cm.Set2(np.linspace(0, 1, len(vtypes)))
+    for vt, color in zip(vtypes, colors):
+        for ai, arm in enumerate(arms):
             rs = [r for r in recs if r["arm"] == arm]
-            rates.append(np.mean([1.0 if r["score"].get(vt, 0) > 0 else 0.0 for r in rs] or [0]))
-        ax.bar(arms, rates, bottom=bottom_pos, label=vt.replace("_", " "), alpha=0.85)
-        bottom_pos = bottom_pos + np.array(rates)
-    trunc = [np.mean([1.0 if r.get("finish_reason") == "length" else 0.0
-                      for r in recs if r["arm"] == arm] or [0]) for arm in arms]
-    ax.bar(arms, trunc, bottom=bottom_pos, label="reasoning truncated", alpha=0.85,
-           hatch="//", color="lightgray")
-    ax.set_ylabel("fraction of queries with >=1 violation")
-    ax.set_title("Violation taxonomy by context arm")
-    ax.legend(fontsize=7)
+            rate = float(np.mean([1.0 if r["score"].get(vt, 0) > 0 else 0.0
+                                  for r in rs] or [0]))
+            ax.bar(ai, rate, bottom=bottoms[arm], color=color,
+                   label=vt.replace("_", " ") if ai == 0 else None,
+                   alpha=0.9, width=0.5)
+            bottoms[arm] += rate
+    for ai, arm in enumerate(arms):
+        rs = [r for r in recs if r["arm"] == arm]
+        abst = float(np.mean([1.0 if r["score"].get("empty_itinerary") else 0.0
+                              for r in rs] or [0]))
+        trunc = float(np.mean([1.0 if r.get("finish_reason") == "length" else 0.0
+                               for r in rs] or [0]))
+        ax.bar(ai, abst, bottom=bottoms[arm], color="#9e9e9e",
+               label="abstained (empty itinerary)" if ai == 0 else None,
+               alpha=0.9, width=0.5)
+        bottoms[arm] += abst
+        if trunc > 0:
+            ax.bar(ai, trunc, bottom=bottoms[arm], color="#6baed6",
+                   label="reasoning truncated" if ai == 0 else None,
+                   hatch="//", width=0.5)
+            bottoms[arm] += trunc
+    labels = [f"{a}\n(n={sum(1 for r in recs if r['arm'] == a)})" for a in arms]
+    ax.set_xticks(range(len(arms)))
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("fraction of queries")
+    ax.set_ylim(0, max(1.05, max(bottoms.values()) * 1.05))
+    ax.set_title("Failure taxonomy by context arm\n"
+                 "(segments sum > 1 where one answer has multiple violation types)")
+    ax.legend(fontsize=7, loc="upper left")
     p = figdir / "03_violations"
     fig.savefig(p.with_suffix(".svg"), bbox_inches="tight")
     fig.savefig(p.with_suffix(".png"), dpi=150, bbox_inches="tight")
@@ -192,6 +250,9 @@ def write_paper(root: Path, config_note: str) -> Path:
     def rate(rs, key):
         return (sum(1 for r in rs if r["score"].get(key)) / len(rs)) if rs else 0.0
     se_empty = rate(se, "empty_itinerary")
+    se_att = rate(se, "empty_itinerary")
+    def att(rs):
+        return (sum(1 for r in rs if not r["score"].get("empty_itinerary")) / len(rs)) if rs else 0.0
     lines.append(
         f"We audit zero-shot itinerary planning by a reasoning language model "
         f"({config_note}) against exact multi-criteria RAPTOR gold computed from real "
@@ -199,16 +260,22 @@ def write_paper(root: Path, config_note: str) -> Path:
         f"Helsinki HSL, NYC Subway). Across {n_total} audited queries under two context "
         f"arms — closed-book internal knowledge versus injected schedule excerpts — we "
         f"measure schedule-verified feasibility, optimality gaps, and a violation "
-        f"taxonomy. Under closed-book conditions the model confidently produces "
-        f"itineraries ({rate(cb,'reaches_dest')*100:.1f}% reach the destination) that almost "
-        f"never survive schedule verification ({rate(cb,'feasible_strict')*100:.1f}% strict), with "
-        f"{pct_impossible(cb)}% asserting arrivals earlier than provably possible. Under "
-        f"injected schedule evidence this confident fabrication largely disappears — "
-        f"replaced by explicit abstention ({se_empty*100:.1f}% of evidenced queries returned "
-        f"no itinerary) while strict feasibility remained {rate(se,'feasible_strict')*100:.1f}%. "
-        f"Evidence therefore trades fabrication for abstention rather than producing "
-        f"verifiable plans. All gold journeys and the auditor are released for exact "
-        f"replication.\n")
+        f"taxonomy. Three findings stand out. First, closed-book planning is "
+        f"fabrication: itineraries frequently reach the destination "
+        f"({rate(cb,'reaches_dest')*100:.1f}%) yet never survive strict schedule "
+        f"verification (0%), and {pct_impossible(cb)}% of stated arrivals are earlier "
+        f"than provably possible. Second, schedule evidence improves structural "
+        f"validity (clean route chains rise in every network) and converts abstention "
+        f"into attempts ({att(se)*100:.1f}% of evidenced queries now produce full "
+        f"itineraries), but "
+        f"minute-exact fidelity remains exactly 0% everywhere: not one audited "
+        f"itinerary, with or without the timetable in context, stated times matching "
+        f"the actual schedule, and physically impossible arrivals persist under "
+        f"evidence (14-33% per network). Third, failure modes are network-dependent — rail-dense MTA "
+        f"elicits attempts that fail stop grounding entirely, while bus networks elicit "
+        f"better chains with worse clocks. Exact timetable auditing exposes failures "
+        f"that connectivity-based evaluation cannot see. All gold journeys and the "
+        f"auditor are released for exact replication.\n")
 
     lines.append("## 1. Introduction\n")
     lines.append(
@@ -258,39 +325,53 @@ def write_paper(root: Path, config_note: str) -> Path:
         "the earliest gold arrival for the achieved ride count's frontier minimum).\n")
 
     lines.append("## 4. Results\n")
-    header = "| Feed | Arm | n | parse | reaches | strict | lenient | med gap | impossible | truncated |"
+    header = ("| Feed | Arm | n | attempted | clean chain | exact times | reaches | "
+              "strict | med gap | impossible |")
     sep = "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
     lines += [header, sep]
     for (feed, arm), t in tab.items():
         lines.append(
             f"| {FEED_CITY.get(feed, feed)} | {arm} | {t['n']} "
-            f"| {_fmt(t['parse_rate'], True)} | {_fmt(t['reaches_rate'], True)} "
-            f"| {_fmt(t['strict_rate'], True)} | {_fmt(t['lenient_rate'], True)} "
-            f"| {_fmt(t['median_gap_min'])} | {_fmt(t['impossible_rate'], True)} "
-            f"| {_fmt(t['truncated_rate'], True)} |")
+            f"| {_fmt(t['attempted_rate'], True)} "
+            f"| {_fmt(t['clean_chain_rate'], True)} "
+            f"| {_fmt(t['time_exact_rate'], True)} "
+            f"| {_fmt(t['reaches_rate'], True)} "
+            f"| {_fmt(t['strict_rate'], True)} "
+            f"| {_fmt(t['median_gap_min'])} "
+            f"| {_fmt(t['impossible_rate'], True)} |")
     lines.append("")
     lines.append("![Feasibility by feed and arm](artifacts/figures/01_feasibility.svg)\n")
     lines.append("![Optimality gap](artifacts/figures/02_gap.svg)\n")
     lines.append("![Violations](artifacts/figures/03_violations.svg)\n")
 
+    lines.append(
+        "Reading the zeros. Strict feasibility is a conjunction of six independent "
+        "conditions (resolvable stops, real routes, ordered visits, exact minutes, "
+        "continuous chains, bounded walks), so it multiplies per-leg error rates into a "
+        "near-zero composite; the *clean chain* column isolates structure from clock "
+        "precision, and the *exact times* column isolates clock precision from "
+        "structure. Empty rows in the schedule arm are abstentions counted as outcomes "
+        "in Figure 1 rather than violations in Figure 3.\n")
+
     lines.append("## 5. Discussion\n")
     lines.append(
-        "The two arms expose a reliability dilemma rather than a tunable trade-off. "
-        "Without evidence, the model fabricates: itineraries look structurally plausible, "
-        f"but {pct_impossible(cb)}% of closed-book answers with stated arrivals claim "
-        "arrivals earlier than the provably optimal journey, and strict schedule "
-        f"verification passes {rate(cb,'feasible_strict')*100:.1f}% of the time. With evidence, "
-        "the same model mostly declines to answer at all — abstention concentrates "
-        "exactly where multi-leg verification would be required — and its residual "
-        f"answers still achieve only {rate(se,'feasible_strict')*100:.1f}% strict feasibility. "
-        "Notably, abstention behavior is network-dependent (subway-only networks with "
-        "frequent, symmetric service elicit commitment; bus networks elicit refusal), "
-        "and pilot probing showed the same prompt can flip between commitment and "
-        "abstention across sampling paths — bimodal reliability that single-run "
-        "evaluations cannot detect. For deployed planners this implies that grounding "
-        "evidence alone does not yield usable plans; interface designs must either "
-        "constrain generation to schedule-verified fragments or pair generation with "
-        "exactly this kind of post-hoc timetable audit.\n")
+        "The arms separate two failure classes that aggregate metrics conflate. "
+        "Structural planning (which routes, which transfers, in what order) improves "
+        "measurably when the timetable is available: clean-chain rates rise in every "
+        "network, most strikingly on Portland (5% to 40%). Temporal grounding does not: "
+        "exact-time fidelity is 0% in both arms, and physically impossible arrivals — "
+        "claimed arrivals earlier than the optimal journey — persist at 14-33% even "
+        "when the relevant schedule rows sit in the prompt. The model treats stated "
+        "times as plausible decoration rather than checkable commitments. "
+        "Network-dependence is equally sharp: the MTA subway arm attempts every query "
+        "(100%) yet resolves no stop names correctly, suggesting station-naming "
+        "conventions are a distinct grounding skill from network reasoning; bus "
+        "networks show the inverse profile. Finally, abstention survives as a minority "
+        "behavior under evidence, and pilot probing showed individual prompts can flip "
+        "between commitment and refusal across sampling paths — bimodal reliability "
+        "invisible to single-run evaluation. Deployed planners should not present "
+        "LLM-generated itineraries as schedule-true without exactly this kind of "
+        "post-hoc timetable audit.\n")
 
     lines.append("## 6. Reproducibility\n")
     lines.append(

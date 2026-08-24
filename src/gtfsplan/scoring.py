@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import unicodedata
 from dataclasses import dataclass, field, asdict
 
@@ -54,7 +55,8 @@ def _parse_hhmm(s: str) -> int | None:
 
 class ScheduleAuditor:
     def __init__(self, index_db, net):
-        self.con = sqlite3.connect(index_db)
+        self.con = sqlite3.connect(index_db, check_same_thread=False)
+        self.lock = threading.Lock()
         self.net = net
         self._name_to_id: dict[str, list[str]] = {}
         for sid, name in self.con.execute("SELECT stop_id, stop_name FROM stops"):

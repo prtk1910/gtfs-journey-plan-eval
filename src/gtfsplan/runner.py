@@ -125,9 +125,14 @@ def run_eval(
         return rec
 
     t0 = time.time()
+    failures = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(work, t) for t in tasks]
-        for _ in as_completed(futures):
-            pass
-    print(f"eval complete: {stats['done']} records in {time.time()-t0:.0f}s -> {out_path}")
+        for fut in as_completed(futures):
+            exc = fut.exception()
+            if exc is not None:
+                failures += 1
+                print(f"TASK FAILURE: {exc}", flush=True)
+    print(f"eval complete: {stats['done']} records, {failures} task failures "
+          f"in {time.time()-t0:.0f}s -> {out_path}")
     return out_path

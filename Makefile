@@ -8,7 +8,14 @@ include $(ROOT)/.env
 export
 endif
 
-.PHONY: setup test fetch build smoke run paper clean
+# Tunables (defaults shown)
+FEED ?= trimet
+WALK ?= 300          # metres; inter-stop walking edges for gold generation
+N ?=                 # per-feed cap on evaluated gold items (empty = all)
+WORKERS ?= 12        # concurrent API calls
+ARMS ?= closed_book,schedule_excerpt
+
+.PHONY: setup test fetch build gold smoke run paper clean
 
 setup:
 	$(PYTHON) -m venv .venv
@@ -17,20 +24,22 @@ setup:
 test:
 	PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 
-fetch FEED=trimet:
+fetch:
 	.venv/bin/python -m gtfsplan.pipeline fetch --feed $(FEED)
 
-build FEED=trimet:
+build:
 	.venv/bin/python -m gtfsplan.pipeline build --feed $(FEED)
 
-gold FEED=trimet:
-	.venv/bin/python -m gtfsplan.pipeline gold --feed $(FEED)
+gold:
+	.venv/bin/python -m gtfsplan.pipeline gold --feed $(FEED) --max-walk-m $(WALK)
 
 smoke:
 	.venv/bin/python -m gtfsplan.pipeline smoke
 
 run:
-	.venv/bin/python -m gtfsplan.pipeline run
+	.venv/bin/python -m gtfsplan.pipeline run \
+		--feeds trimet,cta,hsl,mta --arms $(ARMS) \
+		$(if $(N),--n-per-feed $(N),) --workers $(WORKERS)
 
 paper:
 	.venv/bin/python -m gtfsplan.pipeline paper
