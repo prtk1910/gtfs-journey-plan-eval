@@ -1,24 +1,14 @@
-"""Parse model itinerary JSON and audit each leg against the GTFS schedule.
-
-The evaluator operates at the same abstraction level exposed to the model:
-
-- model times are HH:MM, so strict schedule matching is minute-exact rather
-  than second-exact;
-- rider-visible stop names may correspond to multiple GTFS stop/platform IDs,
-  so all compatible IDs are considered;
-- route and stop compatibility are evaluated jointly against actual GTFS trips;
-- journey continuity is checked without arbitrarily choosing one platform ID.
-"""
+"""Schedule-aware itinerary scoring and strict JSON elicitation."""
 
 from __future__ import annotations
 
-import datetime as dt
+import difflib
 import json
 import re
 import sqlite3
 import threading
 import unicodedata
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 
 from .network import resolve_active_services
 
@@ -26,18 +16,24 @@ from .network import resolve_active_services
 ITIN_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "itinerary",
-        "strict": False,
+        "name": "transit_itinerary",
+        "strict": True,
         "schema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "legs": {
                     "type": "array",
                     "items": {
                         "type": "object",
+                        "additionalProperties": False,
                         "properties": {
                             "type": {
                                 "type": "string",
+                                "enum": [
+                                    "ride",
+                                    "walk",
+                                ],
                             },
                             "route": {
                                 "type": "string",
@@ -77,64 +73,63 @@ ITIN_SCHEMA = {
 }
 
 
-def _norm(s: str) -> str:
-    s = (
-        unicodedata.normalize(
-            "NFKD",
-            s or "",
-        )
-        .encode(
-            "ascii",
-            "ignore",
-        )
-        .decode()
-    )
+def _norm(
+    value: str,
+) -> str:
+    value = unicodedata.normalize(
+        "NFKD",
+        value or "",
+    ).encode(
+        "ascii",
+        "ignore",
+    ).decode()
 
-    s = re.sub(
+    value = re.sub(
         r"[^a-z0-9]+",
         " ",
-        s.lower(),
+        value.lower(),
     )
 
-    return s.strip()
+    return value.strip()
 
 
 def _parse_hhmm(
-    s: str,
+    value: str,
 ) -> int | None:
     """
-    Parse model-visible HH:MM into the first second of that minute.
+    Convert a model HH:MM timestamp to the beginning of that minute.
 
-    GTFS may contain seconds, while the model output schema intentionally
-    exposes only minute precision.
+    Because the model only emits minute-resolution timestamps, a claimed
+    time HH:MM corresponds to the GTFS interval:
+
+        [HH:MM:00, HH:MM:59]
     """
-    m = re.fullmatch(
+    match = re.fullmatch(
         r"(\d{1,2}):(\d{2})(?::\d{2})?",
-        (s or "").strip(),
+        (value or "").strip(),
     )
 
-    if not m:
+    if not match:
         return None
 
-    hours = int(m.group(1))
-    minutes = int(m.group(2))
+    hour = int(
+        match.group(1)
+    )
 
-    if minutes < 0 or minutes > 59:
+    minute = int(
+        match.group(2)
+    )
+
+    if (
+        hour < 0
+        or minute < 0
+        or minute > 59
+    ):
         return None
 
     return (
-        hours * 3600
-        + minutes * 60
-    )
-
-
-def _same_display_minute(
-    actual_seconds: int,
-    claimed_minute_seconds: int,
-) -> bool:
-    return (
-        int(actual_seconds) // 60
-        == int(claimed_minute_seconds) // 60
+        hour * 3600
+        + minute * 60
     )
 
 
@@ -149,103 +144,111 @@ class ScheduleAuditor:
             check_same_thread=False,
         )
 
-        self.lock = threading.RLock()
+        self.lock = threading.Lock()
+
         self.net = net
 
-        self._name_to_id: dict[
+        # A public stop name may correspond to several GTFS platform IDs.
+        # Keep all of them rather than selecting one arbitrary platform.
+        self._name_to_ids: dict[
             str,
             list[str],
         ] = {}
 
-        with self.lock:
-            for sid, name in self.con.execute(
-                """
-                SELECT
-                    stop_id,
-                    stop_name
-                FROM stops
-                """
-            ):
-                self._name_to_id.setdefault(
-                    _norm(name),
-                    [],
-                ).append(sid)
+        self._stop_name_by_id: dict[
+            str,
+            str,
+        ] = {}
 
-        for ids in self._name_to_id.values():
+        for (
+            stop_id,
+            stop_name,
+        ) in self.con.execute(
+            """
+            SELECT stop_id, stop_name
+            FROM stops
+            """
+        ):
+            normalized = _norm(
+                stop_name or ""
+            )
+
+            if normalized:
+                self._name_to_ids.setdefault(
+                    normalized,
+                    [],
+                ).append(
+                    stop_id
+                )
+
+            self._stop_name_by_id[
+                stop_id
+            ] = (
+                stop_name
+                or ""
+            )
+
+        for ids in self._name_to_ids.values():
             ids.sort()
 
+        # A rider-facing route label may map to more than one internal
+        # route_id. Keep all compatible IDs.
         self._route_by_norm: dict[
             str,
             list[str],
         ] = {}
 
-        with self.lock:
-            route_rows = self.con.execute(
-                """
-                SELECT
-                    route_id,
-                    route_short_name,
-                    route_long_name
-                FROM routes
-                """
-            ).fetchall()
+        for (
+            route_id,
+            short_name,
+            long_name,
+        ) in self.con.execute(
+            """
+            SELECT
+                route_id,
+                route_short_name,
+                route_long_name
+            FROM routes
+            """
+        ):
+            labels = {
+                _norm(
+                    short_name
+                    or ""
+                ),
+                _norm(
+                    long_name
+                    or ""
+                ),
+            }
 
-        for rid, short, long_name in route_rows:
-            for label in (
-                short,
-                long_name,
-            ):
-                n = _norm(label or "")
+            for label in labels:
+                if not label:
+                    continue
 
-                if n:
-                    self._route_by_norm.setdefault(
-                        n,
-                        [],
-                    ).append(rid)
+                self._route_by_norm.setdefault(
+                    label,
+                    [],
+                ).append(
+                    route_id
+                )
 
         for ids in self._route_by_norm.values():
             ids.sort()
 
-        self._active_cache: dict[
-            str,
-            tuple[str, ...],
-        ] = {}
-
-    def close(self):
-        with self.lock:
-            self.con.close()
-
-    # ------------------------------------------------------------------
-    # Active services
-    # ------------------------------------------------------------------
-
-    def active_services(
-        self,
-        day: str,
-    ) -> tuple[str, ...]:
-        cached = self._active_cache.get(
-            day
-        )
-
-        if cached is not None:
-            return cached
-
-        date = dt.date.fromisoformat(
-            day
-        )
-
-        with self.lock:
-            active = tuple(
-                sorted(
-                    resolve_active_services(
-                        self.con,
-                        date,
-                    )
+        self.active_services = tuple(
+            sorted(
+                resolve_active_services(
+                    self.con,
+                    self.net.day,
                 )
             )
+        )
 
-        self._active_cache[day] = active
-        return active
+    def close(
+        self,
+    ):
+        self.con.close()
 
     # ------------------------------------------------------------------
     # Stop resolution
@@ -254,63 +257,81 @@ class ScheduleAuditor:
     def resolve_stops(
         self,
         name: str,
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[
+        list[str],
+        bool,
+    ]:
         """
-        Resolve a rider-visible stop name to every compatible GTFS stop ID.
+        Resolve a public stop name to all matching GTFS stop/platform IDs.
 
         Returns:
-            (candidate_ids, used_fuzzy_match)
+            (candidate_stop_ids, used_fuzzy_match)
         """
-        n = _norm(name)
+        normalized = _norm(
+            name
+        )
 
-        if not n:
+        if not normalized:
             return [], False
 
-        exact = self._name_to_id.get(
-            n
+        exact = self._name_to_ids.get(
+            normalized
         )
 
         if exact:
-            return list(exact), False
+            return (
+                list(
+                    exact
+                ),
+                False,
+            )
 
-        import difflib
-
-        matches = difflib.get_close_matches(
-            n,
-            self._name_to_id.keys(),
-            n=1,
-            cutoff=0.85,
+        candidates = (
+            difflib.get_close_matches(
+                normalized,
+                self._name_to_ids.keys(),
+                n=1,
+                cutoff=0.85,
+            )
         )
 
-        if not matches:
-            return [], False
+        if candidates:
+            return (
+                list(
+                    self._name_to_ids[
+                        candidates[0]
+                    ]
+                ),
+                True,
+            )
 
-        return (
-            list(
-                self._name_to_id[
-                    matches[0]
-                ]
-            ),
-            True,
-        )
+        return [], False
 
     def resolve_stop(
         self,
         name: str,
-    ) -> tuple[str | None, bool]:
+    ) -> tuple[
+        str | None,
+        bool,
+    ]:
         """
-        Backward-compatible single-ID resolver.
+        Compatibility helper for older callers.
 
-        New scoring code should prefer resolve_stops().
+        The main evaluator uses resolve_stops() because choosing one
+        arbitrary platform would create false negatives.
         """
-        ids, fuzzy = self.resolve_stops(
-            name
+        ids, fuzzy = (
+            self.resolve_stops(
+                name
+            )
         )
 
-        if not ids:
-            return None, fuzzy
-
-        return ids[0], fuzzy
+        return (
+            ids[0]
+            if ids
+            else None,
+            fuzzy,
+        )
 
     # ------------------------------------------------------------------
     # Route resolution
@@ -320,41 +341,55 @@ class ScheduleAuditor:
         self,
         label: str,
     ) -> list[str]:
-        n = _norm(label)
-
-        if not n:
-            return []
-
-        ids = self._route_by_norm.get(
-            n
+        normalized = _norm(
+            label
         )
 
-        if ids:
-            return sorted(
-                set(ids)
+        if not normalized:
+            return []
+
+        exact = (
+            self._route_by_norm.get(
+                normalized
+            )
+        )
+
+        if exact:
+            return list(
+                exact
             )
 
-        matches: set[str] = set()
+        matches: set[
+            str
+        ] = set()
 
-        for key, route_ids in (
-            self._route_by_norm.items()
-        ):
+        for (
+            route_label,
+            route_ids,
+        ) in self._route_by_norm.items():
             if (
-                n in key
-                or key in n
+                normalized in route_label
+                or route_label in normalized
             ):
                 matches.update(
                     route_ids
                 )
 
-        return sorted(matches)
+        return sorted(
+            matches
+        )
 
     def resolve_route(
         self,
         label: str,
     ) -> str | None:
-        ids = self.resolve_routes(
-            label
+        """
+        Compatibility helper for older callers.
+        """
+        ids = (
+            self.resolve_routes(
+                label
+            )
         )
 
         return (
@@ -363,8 +398,32 @@ class ScheduleAuditor:
             else None
         )
 
+    def public_name(
+        self,
+        stop_id: str,
+    ) -> str:
+        return (
+            self._stop_name_by_id.get(
+                stop_id,
+                "",
+            )
+        )
+
     # ------------------------------------------------------------------
-    # Ride matching
+    # SQL helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _placeholders(
+        values,
+    ) -> str:
+        return ",".join(
+            "?"
+            for _ in values
+        )
+
+    # ------------------------------------------------------------------
+    # Strict ride audit
     # ------------------------------------------------------------------
 
     def _strict_ride_match(
@@ -372,45 +431,48 @@ class ScheduleAuditor:
         route_ids: list[str],
         from_ids: list[str],
         to_ids: list[str],
-        dep_minute: int,
-        arr_minute: int,
-        active_services: tuple[str, ...],
-    ) -> tuple | None:
+        depart_minute: int | None,
+        arrive_minute: int | None,
+    ):
         """
-        Find an actual scheduled ride matching the model's displayed minute.
+        Match the claimed leg against one real active-service trip.
 
-        The model can only emit HH:MM, so a GTFS departure at 11:21:37
-        legitimately matches a model claim of 11:21.
+        Model output only has HH:MM precision, so a displayed minute is
+        accepted when the GTFS timestamp lies anywhere in that minute.
         """
         if (
             not route_ids
             or not from_ids
             or not to_ids
-            or not active_services
+            or depart_minute is None
+            or arrive_minute is None
+            or not self.active_services
         ):
             return None
 
-        from_ph = ",".join(
-            "?" * len(from_ids)
+        from_ph = (
+            self._placeholders(
+                from_ids
+            )
         )
 
-        to_ph = ",".join(
-            "?" * len(to_ids)
+        to_ph = (
+            self._placeholders(
+                to_ids
+            )
         )
 
-        route_ph = ",".join(
-            "?" * len(route_ids)
+        route_ph = (
+            self._placeholders(
+                route_ids
+            )
         )
 
-        service_ph = ",".join(
-            "?" * len(active_services)
+        service_ph = (
+            self._placeholders(
+                self.active_services
+            )
         )
-
-        dep_lo = dep_minute
-        dep_hi = dep_minute + 59
-
-        arr_lo = arr_minute
-        arr_hi = arr_minute + 59
 
         sql = f"""
             SELECT
@@ -427,14 +489,15 @@ class ScheduleAuditor:
               ON t.trip_id = a.trip_id
             WHERE a.stop_id IN ({from_ph})
               AND b.stop_id IN ({to_ph})
-              AND a.stop_sequence < b.stop_sequence
               AND t.route_id IN ({route_ph})
               AND t.service_id IN ({service_ph})
+              AND a.stop_sequence < b.stop_sequence
               AND a.departure_s BETWEEN ? AND ?
               AND b.arrival_s BETWEEN ? AND ?
             ORDER BY
                 a.departure_s,
-                b.arrival_s
+                b.arrival_s,
+                a.trip_id
             LIMIT 1
         """
 
@@ -442,11 +505,11 @@ class ScheduleAuditor:
             *from_ids,
             *to_ids,
             *route_ids,
-            *active_services,
-            dep_lo,
-            dep_hi,
-            arr_lo,
-            arr_hi,
+            *self.active_services,
+            depart_minute,
+            depart_minute + 59,
+            arrive_minute,
+            arrive_minute + 59,
         )
 
         with self.lock:
@@ -455,44 +518,108 @@ class ScheduleAuditor:
                 params,
             ).fetchone()
 
+    # ------------------------------------------------------------------
+    # Lenient ride audit
+    # ------------------------------------------------------------------
+
     def _lenient_ride_match(
         self,
         route_ids: list[str],
         from_ids: list[str],
         to_ids: list[str],
-        earliest: int,
-        latest: int,
-        active_services: tuple[str, ...],
-    ) -> tuple | None:
+        depart_minute: int | None,
+        arrive_minute: int | None,
+        window_s: int = 1800,
+    ):
         """
-        Find any compatible scheduled ride for the named route and stops.
+        Test whether the claimed route connects the claimed stops on an
+        active scheduled trip within a broader temporal window.
 
-        This retains the original evaluator's lenient concept: the route chain
-        must exist even if the model's stated minute is wrong.
+        This separates structural route-chain correctness from exact
+        minute-level timetable fidelity.
         """
         if (
             not route_ids
             or not from_ids
             or not to_ids
-            or not active_services
+            or not self.active_services
         ):
             return None
 
-        from_ph = ",".join(
-            "?" * len(from_ids)
+        from_ph = (
+            self._placeholders(
+                from_ids
+            )
         )
 
-        to_ph = ",".join(
-            "?" * len(to_ids)
+        to_ph = (
+            self._placeholders(
+                to_ids
+            )
         )
 
-        route_ph = ",".join(
-            "?" * len(route_ids)
+        route_ph = (
+            self._placeholders(
+                route_ids
+            )
         )
 
-        service_ph = ",".join(
-            "?" * len(active_services)
+        service_ph = (
+            self._placeholders(
+                self.active_services
+            )
         )
+
+        conditions = [
+            f"a.stop_id IN ({from_ph})",
+            f"b.stop_id IN ({to_ph})",
+            f"t.route_id IN ({route_ph})",
+            f"t.service_id IN ({service_ph})",
+            "a.stop_sequence < b.stop_sequence",
+        ]
+
+        params: list = [
+            *from_ids,
+            *to_ids,
+            *route_ids,
+            *self.active_services,
+        ]
+
+        if depart_minute is not None:
+            conditions.append(
+                """
+                a.departure_s
+                BETWEEN ? AND ?
+                """
+            )
+
+            params.extend(
+                [
+                    depart_minute
+                    - window_s,
+                    depart_minute
+                    + 59
+                    + window_s,
+                ]
+            )
+
+        if arrive_minute is not None:
+            conditions.append(
+                """
+                b.arrival_s
+                BETWEEN ? AND ?
+                """
+            )
+
+            params.extend(
+                [
+                    arrive_minute
+                    - window_s,
+                    arrive_minute
+                    + 59
+                    + window_s,
+                ]
+            )
 
         sql = f"""
             SELECT
@@ -507,31 +634,20 @@ class ScheduleAuditor:
               ON a.trip_id = b.trip_id
             JOIN trips t
               ON t.trip_id = a.trip_id
-            WHERE a.stop_id IN ({from_ph})
-              AND b.stop_id IN ({to_ph})
-              AND a.stop_sequence < b.stop_sequence
-              AND t.route_id IN ({route_ph})
-              AND t.service_id IN ({service_ph})
-              AND a.departure_s BETWEEN ? AND ?
+            WHERE {" AND ".join(conditions)}
             ORDER BY
                 a.departure_s,
-                b.arrival_s
+                b.arrival_s,
+                a.trip_id
             LIMIT 1
         """
-
-        params = (
-            *from_ids,
-            *to_ids,
-            *route_ids,
-            *active_services,
-            earliest,
-            latest,
-        )
 
         with self.lock:
             return self.con.execute(
                 sql,
-                params,
+                tuple(
+                    params
+                ),
             ).fetchone()
 
     # ------------------------------------------------------------------
@@ -545,11 +661,17 @@ class ScheduleAuditor:
         max_walk_m: float,
     ) -> bool:
         """
-        Accept a walk when at least one compatible platform pair is within
-        the allowed walking distance.
+        Accept one direct walking/transfer edge.
 
-        Importantly, zero-distance/same-platform walks are valid rather than
-        being converted into a large fallback distance.
+        The routing network contains both:
+
+        - explicit GTFS transfer edges
+        - generated proximity footpaths
+
+        The geographic fallback handles equivalent public-stop/platform
+        representations while respecting the same configured walk limit.
+
+        Importantly, this does not recursively chain walking edges.
         """
         if (
             not from_ids
@@ -558,18 +680,42 @@ class ScheduleAuditor:
             return False
 
         for from_id in from_ids:
+            direct_targets = {
+                target
+                for (
+                    target,
+                    _seconds,
+                )
+                in self.net.footpaths.get(
+                    from_id,
+                    (),
+                )
+            }
+
             for to_id in to_ids:
-                if from_id == to_id:
+                if (
+                    from_id
+                    == to_id
+                ):
                     return True
 
-                dist = self.net.haversine_m(
-                    from_id,
-                    to_id,
+                if (
+                    to_id
+                    in direct_targets
+                ):
+                    return True
+
+                dist = (
+                    self.net.haversine_m(
+                        from_id,
+                        to_id,
+                    )
                 )
 
                 if (
                     dist is not None
-                    and dist <= max_walk_m
+                    and dist
+                    <= max_walk_m
                 ):
                     return True
 
@@ -579,206 +725,298 @@ class ScheduleAuditor:
 @dataclass
 class ScoreResult:
     parse_ok: bool = False
+
     empty_itinerary: bool = False
+
     reaches_dest: bool = False
+
     feasible_strict: bool = False
+
     feasible_lenient: bool = False
-    optimality_gap_min: float | None = None
-    stated_arrival: int | None = None
+
+    optimality_gap_min: (
+        float | None
+    ) = None
+
+    stated_arrival: (
+        int | None
+    ) = None
+
     n_legs: int = 0
+
     n_rides: int = 0
+
     unresolved_stops: int = 0
+
     hallucinated_routes: int = 0
+
     time_mismatches: int = 0
+
     bad_transitions: int = 0
+
     walks_too_long: int = 0
+
     notes: dict = field(
         default_factory=dict
     )
 
-    def to_dict(self):
-        return asdict(self)
+    def to_dict(
+        self,
+    ):
+        return asdict(
+            self
+        )
+
+
+def _places_connect(
+    previous_ids: list[str],
+    previous_name: str,
+    current_ids: list[str],
+    current_name: str,
+) -> bool:
+    """
+    Test continuity without collapsing duplicate platform IDs.
+    """
+    if (
+        previous_ids
+        and current_ids
+        and set(
+            previous_ids
+        ).intersection(
+            current_ids
+        )
+    ):
+        return True
+
+    previous_norm = _norm(
+        previous_name
+    )
+
+    current_norm = _norm(
+        current_name
+    )
+
+    return (
+        bool(
+            previous_norm
+        )
+        and previous_norm
+        == current_norm
+    )
 
 
 def score_itinerary(
     auditor: ScheduleAuditor,
     item: dict,
     content: str,
-    max_walk_m: float = 800.0,
+    max_walk_m: float = 300.0,
 ) -> ScoreResult:
+    """
+    Score one model-generated itinerary.
+
+    Strict feasibility requires:
+    - public-stop continuity
+    - valid direct walking transfers
+    - real route/stop pairs
+    - real active trips
+    - scheduled departure and arrival timestamps within the model's
+      displayed HH:MM minute
+
+    Lenient feasibility preserves the same structural constraints while
+    allowing a broader schedule-time window for ride legs.
+    """
     res = ScoreResult()
 
     try:
-        obj = _strip_fences_and_parse(
-            content
+        obj = (
+            _strip_fences_and_parse(
+                content
+            )
         )
+
     except Exception:
         return res
 
     res.parse_ok = True
 
     legs = (
-        obj.get("legs")
+        obj.get(
+            "legs"
+        )
         or []
     )
 
-    res.n_legs = len(legs)
+    res.n_legs = len(
+        legs
+    )
 
     if not legs:
         res.empty_itinerary = True
         return res
 
-    active_services = auditor.active_services(
-        item["day"]
+    origin_name = (
+        item.get(
+            "origin_name"
+        )
+        or auditor.public_name(
+            item[
+                "origin"
+            ]
+        )
     )
+
+    destination_name = (
+        item.get(
+            "destination_name"
+        )
+        or auditor.public_name(
+            item[
+                "destination"
+            ]
+        )
+    )
+
+    previous_ids = [
+        item[
+            "origin"
+        ]
+    ]
+
+    previous_name = (
+        origin_name
+    )
+
+    # At model-visible HH:MM precision, treat the requested departure
+    # as its containing minute.
+    previous_arrive_minute = (
+        item[
+            "dep_time"
+        ]
+        // 60
+        * 60
+    )
+
+    chain_ok = True
 
     strict_ok = True
+
     lenient_ok = True
 
-    current_time: int | None = (
-        item["dep_time"]
-    )
+    final_to_ids: list[
+        str
+    ] = []
 
-    previous_to_ids: set[str] | None = {
-        item["origin"]
-    }
-
-    previous_to_name = _norm(
-        item.get(
-            "origin_name",
-            "",
-        )
-    )
-
-    ambiguous_stop_mentions = 0
-    fuzzy_stop_mentions = 0
-
-    final_to_ids: list[str] = []
     final_to_name = ""
 
-    for i, leg in enumerate(legs):
+    for leg in legs:
         leg_type = (
-            leg.get("type")
-            or ""
-        ).lower()
-
-        from_text = (
-            leg.get("from")
-            or ""
-        )
-
-        to_text = (
-            leg.get("to")
-            or ""
-        )
-
-        from_ids, from_fuzzy = (
-            auditor.resolve_stops(
-                from_text
+            leg.get(
+                "type"
             )
-        )
+            or ""
+        ).strip().lower()
 
-        to_ids, to_fuzzy = (
-            auditor.resolve_stops(
-                to_text
+        from_name = (
+            leg.get(
+                "from"
             )
+            or ""
         )
 
-        if from_fuzzy:
-            fuzzy_stop_mentions += 1
+        to_name = (
+            leg.get(
+                "to"
+            )
+            or ""
+        )
 
-        if to_fuzzy:
-            fuzzy_stop_mentions += 1
+        (
+            from_ids,
+            _from_fuzzy,
+        ) = auditor.resolve_stops(
+            from_name
+        )
 
-        if len(from_ids) > 1:
-            ambiguous_stop_mentions += 1
+        (
+            to_ids,
+            _to_fuzzy,
+        ) = auditor.resolve_stops(
+            to_name
+        )
 
-        if len(to_ids) > 1:
-            ambiguous_stop_mentions += 1
+        if not from_ids:
+            res.unresolved_stops += 1
+
+        if not to_ids:
+            res.unresolved_stops += 1
 
         if (
             not from_ids
             or not to_ids
         ):
-            res.unresolved_stops += 1
+            chain_ok = False
             strict_ok = False
             lenient_ok = False
 
-            previous_to_ids = (
-                set(to_ids)
-                if to_ids
-                else None
-            )
-
-            previous_to_name = _norm(
-                to_text
-            )
-
-            continue
-
-        # --------------------------------------------------------------
-        # Journey-chain continuity
-        #
-        # Prefer actual candidate-ID overlap. If two rider-visible names
-        # normalize identically, also treat them as the same public stop
-        # abstraction even when GTFS assigns distinct platform IDs.
-        # --------------------------------------------------------------
-
-        current_from_name = _norm(
-            from_text
-        )
-
-        transition_ok = False
-
-        if previous_to_ids is None:
-            transition_ok = True
-
-        elif (
-            previous_to_ids
-            & set(from_ids)
+        if not _places_connect(
+            previous_ids,
+            previous_name,
+            from_ids,
+            from_name,
         ):
-            transition_ok = True
-
-        elif (
-            previous_to_name
-            and current_from_name
-            and previous_to_name
-            == current_from_name
-        ):
-            transition_ok = True
-
-        if not transition_ok:
             res.bad_transitions += 1
-            strict_ok = False
-            lenient_ok = False
 
-        dep_t = _parse_hhmm(
-            leg.get("depart")
+            chain_ok = False
+
+        depart_minute = (
+            _parse_hhmm(
+                leg.get(
+                    "depart",
+                    "",
+                )
+            )
         )
 
-        arr_t = _parse_hhmm(
-            leg.get("arrive")
+        arrive_minute = (
+            _parse_hhmm(
+                leg.get(
+                    "arrive",
+                    "",
+                )
+            )
         )
 
-        # Model times are minute-level. Reject obvious backwards time.
         if (
-            dep_t is not None
-            and current_time is not None
+            depart_minute
+            is None
+            or arrive_minute
+            is None
         ):
-            # Compare displayed minutes rather than hidden GTFS seconds.
+            res.time_mismatches += 1
+
+            strict_ok = False
+
+        else:
             if (
-                dep_t // 60
-                < current_time // 60
+                depart_minute
+                < previous_arrive_minute
             ):
                 res.bad_transitions += 1
-                strict_ok = False
-                lenient_ok = False
 
-        # --------------------------------------------------------------
-        # Walking leg
-        # --------------------------------------------------------------
+                chain_ok = False
 
-        if leg_type == "walk":
+            if (
+                arrive_minute
+                < depart_minute
+            ):
+                res.bad_transitions += 1
+
+                chain_ok = False
+
+        if (
+            leg_type
+            == "walk"
+        ):
             walk_ok = (
                 auditor.walk_pair_exists(
                     from_ids,
@@ -789,262 +1027,195 @@ def score_itinerary(
 
             if not walk_ok:
                 res.walks_too_long += 1
+
                 strict_ok = False
                 lenient_ok = False
 
-            if arr_t is not None:
-                current_time = arr_t
-            elif dep_t is not None:
-                current_time = dep_t
+        elif (
+            leg_type
+            == "ride"
+        ):
+            res.n_rides += 1
 
-            previous_to_ids = set(
-                to_ids
+            route_ids = (
+                auditor.resolve_routes(
+                    leg.get(
+                        "route",
+                        "",
+                    )
+                )
             )
 
-            previous_to_name = _norm(
-                to_text
-            )
+            if not route_ids:
+                res.hallucinated_routes += 1
 
-            final_to_ids = to_ids
-            final_to_name = _norm(
-                to_text
-            )
+                strict_ok = False
+                lenient_ok = False
 
-            continue
+            else:
+                strict_match = (
+                    auditor._strict_ride_match(
+                        route_ids,
+                        from_ids,
+                        to_ids,
+                        depart_minute,
+                        arrive_minute,
+                    )
+                )
 
-        # --------------------------------------------------------------
-        # Ride leg
-        # --------------------------------------------------------------
+                if (
+                    strict_match
+                    is None
+                ):
+                    res.time_mismatches += 1
 
-        res.n_rides += 1
+                    strict_ok = False
 
-        route_label = (
-            leg.get("route")
-            or ""
-        )
+                lenient_match = (
+                    auditor._lenient_ride_match(
+                        route_ids,
+                        from_ids,
+                        to_ids,
+                        depart_minute,
+                        arrive_minute,
+                    )
+                )
 
-        route_ids = (
-            auditor.resolve_routes(
-                route_label
-            )
-        )
+                if (
+                    lenient_match
+                    is None
+                ):
+                    lenient_ok = False
 
-        if not route_ids:
-            res.hallucinated_routes += 1
+        else:
+            chain_ok = False
             strict_ok = False
             lenient_ok = False
 
-            if arr_t is not None:
-                current_time = arr_t
-
-            previous_to_ids = set(
-                to_ids
-            )
-
-            previous_to_name = _norm(
-                to_text
-            )
-
-            final_to_ids = to_ids
-            final_to_name = _norm(
-                to_text
-            )
-
-            continue
-
-        strict_match = None
-
-        if (
-            dep_t is not None
-            and arr_t is not None
-        ):
-            strict_match = (
-                auditor._strict_ride_match(
-                    route_ids,
-                    from_ids,
-                    to_ids,
-                    dep_t,
-                    arr_t,
-                    active_services,
-                )
-            )
-
-        if strict_match is None:
-            res.time_mismatches += 1
-            strict_ok = False
-
-            anchor = (
-                dep_t
-                if dep_t is not None
-                else (
-                    current_time
-                    if current_time is not None
-                    else item["dep_time"]
-                )
-            )
-
-            lenient_match = (
-                auditor._lenient_ride_match(
-                    route_ids,
-                    from_ids,
-                    to_ids,
-                    anchor - 1800,
-                    anchor + 5400,
-                    active_services,
-                )
-            )
-
-            if lenient_match is None:
-                lenient_ok = False
-
-                if arr_t is not None:
-                    current_time = arr_t
-
-            else:
-                actual_arrival = int(
-                    lenient_match[5]
-                )
-
-                current_time = (
-                    actual_arrival
-                )
-
-        else:
-            actual_arrival = int(
-                strict_match[5]
-            )
-
-            # For onward time consistency, retain minute precision because
-            # that is all the model was allowed to express.
-            current_time = (
-                actual_arrival // 60
-            ) * 60
-
-        previous_to_ids = set(
+        previous_ids = (
             to_ids
         )
 
-        previous_to_name = _norm(
-            to_text
-        )
-
-        final_to_ids = to_ids
-        final_to_name = _norm(
-            to_text
+        previous_name = (
+            to_name
         )
 
         if (
-            i
-            == len(legs) - 1
-            and arr_t is not None
+            arrive_minute
+            is not None
         ):
-            res.stated_arrival = arr_t
+            previous_arrive_minute = (
+                arrive_minute
+            )
 
-    # ------------------------------------------------------------------
-    # Destination check
-    # ------------------------------------------------------------------
+        final_to_ids = (
+            to_ids
+        )
 
-    target_id = item[
-        "destination"
-    ]
+        final_to_name = (
+            to_name
+        )
 
-    target_name = _norm(
-        item.get(
-            "destination_name",
-            "",
+    res.reaches_dest = (
+        item[
+            "destination"
+        ]
+        in final_to_ids
+        or (
+            bool(
+                _norm(
+                    final_to_name
+                )
+            )
+            and _norm(
+                final_to_name
+            )
+            == _norm(
+                destination_name
+            )
+        )
+    )
+
+    final_arrival = (
+        _parse_hhmm(
+            legs[
+                -1
+            ].get(
+                "arrive",
+                "",
+            )
         )
     )
 
     if (
-        target_id in final_to_ids
-        or (
-            target_name
-            and final_to_name
-            == target_name
-        )
+        final_arrival
+        is not None
     ):
-        res.reaches_dest = True
-
-    if (
-        res.reaches_dest
-        and res.stated_arrival is None
-    ):
-        last = legs[-1]
-
         res.stated_arrival = (
-            _parse_hhmm(
-                last.get("arrive")
-            )
+            final_arrival
         )
-
-    # ------------------------------------------------------------------
-    # Feasibility
-    # ------------------------------------------------------------------
 
     res.feasible_lenient = (
-        lenient_ok
+        chain_ok
+        and lenient_ok
         and res.reaches_dest
-        and res.unresolved_stops == 0
-        and res.hallucinated_routes == 0
-        and res.walks_too_long == 0
-        and res.bad_transitions == 0
+        and res.unresolved_stops
+        == 0
+        and res.hallucinated_routes
+        == 0
+        and res.walks_too_long
+        == 0
+        and res.bad_transitions
+        == 0
     )
 
     res.feasible_strict = (
-        strict_ok
-        and res.feasible_lenient
-        and res.time_mismatches == 0
+        res.feasible_lenient
+        and strict_ok
+        and res.time_mismatches
+        == 0
     )
 
-    # ------------------------------------------------------------------
-    # Optimality
-    #
-    # The public output schema is minute-resolution, so compare against the
-    # gold frontier at minute resolution too. A model saying 12:08 should
-    # not be credited or penalized because the hidden GTFS value is 12:08:08.
-    # ------------------------------------------------------------------
+    pareto_values = [
+        int(
+            value
+        )
+        for value
+        in item.get(
+            "pareto",
+            {},
+        ).values()
+    ]
 
-    pareto_min = min(
-        int(v)
-        for v in item[
-            "pareto"
-        ].values()
-    )
-
-    if (
-        res.reaches_dest
-        and res.stated_arrival is not None
-    ):
-        stated_minute = (
-            res.stated_arrival
-            // 60
+    if pareto_values:
+        pareto_min = min(
+            pareto_values
         )
 
-        gold_minute = (
-            pareto_min
-            // 60
-        )
+        res.notes[
+            "pareto_min"
+        ] = pareto_min
 
-        res.optimality_gap_min = float(
-            stated_minute
-            - gold_minute
-        )
+        if (
+            res.reaches_dest
+            and res.stated_arrival
+            is not None
+        ):
+            # Compare at the same minute resolution available to the model.
+            stated_minute = (
+                res.stated_arrival
+                // 60
+            )
 
-    res.notes[
-        "pareto_min"
-    ] = pareto_min
+            gold_minute = (
+                pareto_min
+                // 60
+            )
 
-    res.notes[
-        "pareto_minute"
-    ] = pareto_min // 60
-
-    res.notes[
-        "ambiguous_stop_mentions"
-    ] = ambiguous_stop_mentions
-
-    res.notes[
-        "fuzzy_stop_mentions"
-    ] = fuzzy_stop_mentions
+            res.optimality_gap_min = float(
+                stated_minute
+                - gold_minute
+            )
 
     return res
 
@@ -1052,34 +1223,53 @@ def score_itinerary(
 def _strip_fences_and_parse(
     content: str,
 ) -> dict:
-    t = (
+    text = (
         content
         or ""
     ).strip()
 
-    if t.startswith("```"):
+    if text.startswith(
+        "```"
+    ):
         lines = [
-            ln
-            for ln in t.splitlines()
-            if not ln.strip().startswith(
+            line
+            for line
+            in text.splitlines()
+            if not line.strip().startswith(
                 "```"
             )
         ]
 
-        t = "\n".join(
+        text = "\n".join(
             lines
         ).strip()
 
-    m = re.search(
+    match = re.search(
         r"\{.*\}",
-        t,
+        text,
         re.DOTALL,
     )
 
-    if m:
-        t = m.group(0)
+    if match:
+        text = (
+            match.group(
+                0
+            )
+        )
 
-    return json.loads(t)
+    parsed = json.loads(
+        text
+    )
+
+    if not isinstance(
+        parsed,
+        dict,
+    ):
+        raise ValueError(
+            "itinerary response must be a JSON object"
+        )
+
+    return parsed
 
 
 def chat_json(
@@ -1092,8 +1282,8 @@ def chat_json(
     """
     Strict-JSON elicitation with schema-in-prompt fallback.
 
-    ox-alpha may ignore response_format, so malformed output is followed by
-    explicit JSON-only repair attempts.
+    Some models/providers may ignore response_format, so invalid responses
+    are retried with the schema explicitly included in the conversation.
     """
     import jsonschema
 
@@ -1107,7 +1297,9 @@ def chat_json(
         )
     )
 
-    def validate(text):
+    def validate(
+        text,
+    ):
         obj = (
             _strip_fences_and_parse(
                 text
@@ -1121,7 +1313,7 @@ def chat_json(
 
         return obj
 
-    r = client.chat(
+    response = client.chat(
         messages,
         max_tokens=max_tokens,
         response_format=schema,
@@ -1129,53 +1321,63 @@ def chat_json(
 
     try:
         return validate(
-            r.content
+            response.content
         )
+
     except Exception:
         pass
 
-    augmented = list(
-        messages
-    ) + [
-        {
-            "role": "assistant",
-            "content": r.content,
-        },
-        {
-            "role": "user",
-            "content": (
-                "Reply again with ONLY the raw JSON object "
-                "matching this schema; no prose, no markdown:\n"
-                + json.dumps(
-                    inner,
-                    indent=2,
-                )
-            ),
-        },
-    ]
+    augmented = (
+        list(
+            messages
+        )
+        + [
+            {
+                "role": "assistant",
+                "content": (
+                    response.content
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Reply again with ONLY the raw JSON object "
+                    "matching this schema; no prose, no markdown:\n"
+                    + json.dumps(
+                        inner,
+                        indent=2,
+                    )
+                ),
+            },
+        ]
+    )
 
-    err = None
+    error = None
 
     for _ in range(
         validation_retries
     ):
-        r = client.chat(
-            augmented,
-            max_tokens=max_tokens,
+        response = (
+            client.chat(
+                augmented,
+                max_tokens=max_tokens,
+            )
         )
 
         try:
             return validate(
-                r.content
+                response.content
             )
 
-        except Exception as e:
-            err = e
+        except Exception as exc:
+            error = exc
 
             augmented.append(
                 {
                     "role": "assistant",
-                    "content": r.content,
+                    "content": (
+                        response.content
+                    ),
                 }
             )
 
@@ -1191,5 +1393,5 @@ def chat_json(
 
     raise RuntimeError(
         "chat_json failed after retries: "
-        f"{err}"
+        f"{error}"
     )

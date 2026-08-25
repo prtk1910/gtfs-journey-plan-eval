@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import random
 
 
@@ -52,18 +53,31 @@ def render_query(
     item: dict,
     variant: int,
 ) -> str:
-    rng = random.Random(
-        hash(
-            (
-                item["feed"],
-                item["origin"],
-                item["destination"],
-                item["dep_time"],
-                variant,
-            )
-        )
-        & 0xFFFF
+    """
+    Render a deterministic natural-language query for one gold item.
+
+    Python's built-in hash() is intentionally not used here because it is
+    salted independently for different interpreter processes. A SHA-256
+    derived seed makes paraphrase selection reproducible across runs.
+    """
+    seed_material = (
+        item["feed"],
+        item["origin"],
+        item["destination"],
+        item["dep_time"],
+        variant,
     )
+
+    digest = hashlib.sha256(
+        repr(seed_material).encode("utf-8")
+    ).digest()
+
+    seed = int.from_bytes(
+        digest[:8],
+        "big",
+    )
+
+    rng = random.Random(seed)
 
     tmpl = PARAPHRASES[
         variant % len(PARAPHRASES)
