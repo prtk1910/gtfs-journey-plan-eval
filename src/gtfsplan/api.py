@@ -1,4 +1,4 @@
-"""OpenRouter client with content-addressed caching and bounded retries."""
+"""OpenCode Zen client with content-addressed caching and bounded retries."""
 
 from __future__ import annotations
 
@@ -14,7 +14,12 @@ from pathlib import Path
 import requests
 
 
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
+API_URL = os.environ.get(
+    "OX_API_URL",
+    "https://opencode.ai/zen/v1/chat/completions",
+)
+
+DEFAULT_MODEL = "x-preview-f-free"
 
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_TIMEOUT_S = 300
@@ -140,23 +145,20 @@ class Ledger:
             ).fetchall()
 
 
-class OpenRouterClient:
+class OpenCodeZenClient:
     def __init__(
         self,
         ledger_path: Path,
         model: str | None = None,
     ):
         self.key = os.environ.get(
-            "OPENROUTER_API_KEY",
+            "OPENCODE_ZEN_API_KEY",
             "",
         )
 
-        if (
-            not self.key
-            or "replace-with" in self.key
-        ):
+        if not self.key:
             raise RuntimeError(
-                "OPENROUTER_API_KEY missing; "
+                "OPENCODE_ZEN_API_KEY missing; "
                 "set it in the root .env"
             )
 
@@ -164,7 +166,7 @@ class OpenRouterClient:
             model
             or os.environ.get(
                 "OX_MODEL",
-                "stealth/ox-alpha",
+                DEFAULT_MODEL,
             )
         )
 
@@ -172,21 +174,13 @@ class OpenRouterClient:
             ledger_path
         )
 
-        # Each worker thread gets its own HTTP session and response
-        # metadata. This avoids cross-worker races.
+        # Each evaluation worker gets its own HTTP session and
+        # response metadata. This avoids cross-thread state races.
         self._local = threading.local()
 
         self._headers = {
             "Authorization": (
                 f"Bearer {self.key}"
-            ),
-            "HTTP-Referer": os.environ.get(
-                "OPENROUTER_SITE_URL",
-                "",
-            ),
-            "X-Title": os.environ.get(
-                "OPENROUTER_APP_TITLE",
-                "research-evals",
             ),
             "Content-Type": "application/json",
         }
@@ -281,7 +275,10 @@ class OpenRouterClient:
                 "",
             )
 
-        choice = choices[0]
+        choice = (
+            choices[0]
+            or {}
+        )
 
         message = (
             choice.get("message")
@@ -293,8 +290,10 @@ class OpenRouterClient:
             or ""
         )
 
+        # Different OpenAI-compatible gateways have used both names.
         reasoning = (
             message.get("reasoning")
+            or message.get("reasoning_content")
             or ""
         )
 
@@ -355,23 +354,6 @@ class OpenRouterClient:
             MAX_RETRY_DELAY_S,
         )
 
-    def _is_daily_quota_error(
-        self,
-        response: requests.Response,
-    ) -> bool:
-        if response.status_code != 429:
-            return False
-
-        text = (
-            response.text
-            or ""
-        ).lower()
-
-        return (
-            "free-models-per-day" in text
-            or "daily free-model quota" in text
-        )
-
     def chat(
         self,
         messages: list[dict],
@@ -380,8 +362,8 @@ class OpenRouterClient:
         response_format: dict | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> CallResult:
-        # Reset per-call metadata so a failed request cannot inherit
-        # finish/reasoning information from the previous call.
+        # Do not allow a failed call to inherit metadata from the
+        # preceding call on the same worker.
         self._set_last_metadata(
             "",
             "",
@@ -432,8 +414,6 @@ class OpenRouterClient:
                 body
             )
 
-            # Prefer the stored content column, but fall back to the
-            # response body for older ledger records.
             if not content:
                 content = cached_content
 
@@ -488,11 +468,6 @@ class OpenRouterClient:
         ):
             started = time.monotonic()
 
-            response: (
-                requests.Response
-                | None
-            ) = None
-
             try:
                 response = session.post(
                     API_URL,
@@ -509,14 +484,10 @@ class OpenRouterClient:
                 ):
                     break
 
-                sleep_for = (
+                time.sleep(
                     self._retry_delay(
                         delay
                     )
-                )
-
-                time.sleep(
-                    sleep_for
                 )
 
                 delay = min(
@@ -532,7 +503,7 @@ class OpenRouterClient:
 
                 except ValueError as exc:
                     last_error = RuntimeError(
-                        "OpenRouter returned "
+                        "OpenCode Zen returned "
                         "HTTP 200 with invalid JSON: "
                         f"{exc}"
                     )
@@ -577,20 +548,22 @@ class OpenRouterClient:
                     * 1000
                 )
 
-                model = body.get(
+                returned_model = body.get(
                     "model",
                     self.model,
                 )
 
                 self.ledger.put(
                     key=key,
-                    model=model,
+                    model=returned_model,
                     request_json=json.dumps(
                         payload,
                         sort_keys=True,
+                        ensure_ascii=False,
                     ),
                     response_json=json.dumps(
-                        body
+                        body,
+                        ensure_ascii=False,
                     ),
                     content=content,
                     prompt_tokens=usage.get(
@@ -611,7 +584,7 @@ class OpenRouterClient:
 
                 return CallResult(
                     key=key,
-                    model=model,
+                    model=returned_model,
                     content=content,
                     prompt_tokens=usage.get(
                         "prompt_tokens",
@@ -627,21 +600,11 @@ class OpenRouterClient:
                     reasoning=reasoning,
                 )
 
-            # A daily free-model quota exhaustion cannot recover through
-            # short retries. Fail immediately so we do not burn extra
-            # requests or keep workers occupied unnecessarily.
-            if self._is_daily_quota_error(
-                response
-            ):
-                raise RuntimeError(
-                    "OpenRouter daily free-model quota exhausted: "
-                    f"{response.text[:500]}"
-                )
-
             retryable = (
                 response.status_code
                 in (
                     408,
+                    409,
                     429,
                 )
                 or response.status_code
@@ -652,7 +615,7 @@ class OpenRouterClient:
                 last_error = RuntimeError(
                     "HTTP "
                     f"{response.status_code}: "
-                    f"{response.text[:200]}"
+                    f"{response.text[:500]}"
                 )
 
                 if (
@@ -661,15 +624,11 @@ class OpenRouterClient:
                 ):
                     break
 
-                sleep_for = (
+                time.sleep(
                     self._retry_delay(
                         delay,
                         response,
                     )
-                )
-
-                time.sleep(
-                    sleep_for
                 )
 
                 delay = min(
@@ -680,13 +639,13 @@ class OpenRouterClient:
                 continue
 
             raise RuntimeError(
-                "HTTP "
+                "OpenCode Zen HTTP "
                 f"{response.status_code}: "
-                f"{response.text[:500]}"
+                f"{response.text[:1000]}"
             )
 
         raise RuntimeError(
-            "OpenRouter request failed "
+            "OpenCode Zen request failed "
             f"after {max_retries} attempts; "
             f"last error: {last_error}"
         )
@@ -695,6 +654,11 @@ class OpenRouterClient:
         self,
     ) -> list[tuple]:
         return self.ledger.stats()
+
+
+# Backwards-compatible alias in case anything outside runner.py imports
+# the old client class directly.
+OpenRouterClient = OpenCodeZenClient
 
 
 def default_ledger_path(
@@ -709,8 +673,8 @@ def default_ledger_path(
 
 def load_client(
     root: Path,
-) -> OpenRouterClient:
-    return OpenRouterClient(
+) -> OpenCodeZenClient:
+    return OpenCodeZenClient(
         default_ledger_path(
             root
         )
