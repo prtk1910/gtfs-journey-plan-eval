@@ -172,8 +172,8 @@ class OpenRouterClient:
             ledger_path
         )
 
-        # Each worker thread gets its own request Session and
-        # response metadata. This avoids cross-worker metadata races.
+        # Each worker thread gets its own HTTP session and response
+        # metadata. This avoids cross-worker races.
         self._local = threading.local()
 
         self._headers = {
@@ -268,11 +268,7 @@ class OpenRouterClient:
     def _response_metadata(
         self,
         body: dict,
-    ) -> tuple[
-        str,
-        str,
-        str,
-    ]:
+    ) -> tuple[str, str, str]:
         choices = (
             body.get("choices")
             or []
@@ -359,6 +355,23 @@ class OpenRouterClient:
             MAX_RETRY_DELAY_S,
         )
 
+    def _is_daily_quota_error(
+        self,
+        response: requests.Response,
+    ) -> bool:
+        if response.status_code != 429:
+            return False
+
+        text = (
+            response.text
+            or ""
+        ).lower()
+
+        return (
+            "free-models-per-day" in text
+            or "daily free-model quota" in text
+        )
+
     def chat(
         self,
         messages: list[dict],
@@ -367,6 +380,13 @@ class OpenRouterClient:
         response_format: dict | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> CallResult:
+        # Reset per-call metadata so a failed request cannot inherit
+        # finish/reasoning information from the previous call.
+        self._set_last_metadata(
+            "",
+            "",
+        )
+
         payload: dict = {
             "model": self.model,
             "messages": messages,
@@ -412,8 +432,8 @@ class OpenRouterClient:
                 body
             )
 
-            # Prefer the stored content column, but fall back to
-            # the response body for older ledger records.
+            # Prefer the stored content column, but fall back to the
+            # response body for older ledger records.
             if not content:
                 content = cached_content
 
@@ -509,6 +529,7 @@ class OpenRouterClient:
             if response.status_code == 200:
                 try:
                     body = response.json()
+
                 except ValueError as exc:
                     last_error = RuntimeError(
                         "OpenRouter returned "
@@ -604,6 +625,17 @@ class OpenRouterClient:
                     cached=False,
                     finish_reason=finish_reason,
                     reasoning=reasoning,
+                )
+
+            # A daily free-model quota exhaustion cannot recover through
+            # short retries. Fail immediately so we do not burn extra
+            # requests or keep workers occupied unnecessarily.
+            if self._is_daily_quota_error(
+                response
+            ):
+                raise RuntimeError(
+                    "OpenRouter daily free-model quota exhausted: "
+                    f"{response.text[:500]}"
                 )
 
             retryable = (
